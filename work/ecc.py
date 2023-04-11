@@ -16,10 +16,39 @@ N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141
 GX = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
 GY = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
 
+BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
 
 def hash256(s):
     '''two rounds of sha256'''
     return hashlib.sha256(hashlib.sha256(s).digest()).digest()
+
+
+def encode_base58(s):
+    count = 0
+    for c in s:
+        if c == 0:
+            count += 1
+        else:
+            break
+    
+    num = int.from_bytes(s, "big")
+    prefix = "1" * count
+    result = ""
+    while num > 0:
+        num, mod = divmod(num, 58)
+        result = BASE58_ALPHABET[mod] + result
+    
+    return prefix + result
+
+def encode_base58_checksum(b):
+    return encode_base58(b + hash256((b))[:4])
+
+def hash160(s):
+    """
+    sha256 → ripemd160
+    """
+    return hashlib.new("ripemd160", hashlib.sha256(s).digest()).digest()
 
 
 class FieldElement:
@@ -220,6 +249,9 @@ class S256Field(FieldElement):
     
     def __repr__(self):
         return "{:x}".format(self.num).zfill(64)
+    
+    def sqrt(self):
+        return self ** ((P + 1) // 4)
 
 
 class S256Point(Point):
@@ -243,7 +275,63 @@ class S256Point(Point):
         total = u * G + v * self
 
         return total.x.num == sig.r
+    
+    def sec(self, is_compressed=True):
 
+        if is_compressed:
+            # 圧縮SECフォーマット
+            if self.y.num % 2 == 0:
+                # y座標が偶数のときは、x02のプレフィックス
+                return b"\x02" + self.x.num.to_bytes(32, "big")
+            else:
+                # y座標が奇数のときは、x03のプレフィックス
+                return b"\x03" + self.x.num.to_bytes(32, "big")
+        else:
+            # 非圧縮SECフォーマット。
+            # 0x04のプレフィックスの後に、32バイトのx座標とy座標をビッグエンディアン整数として追加
+            return b"\x04" + self.x.num.to_bytes(32, "big") + self.y.num.to_bytes(32, "big")
+    
+    @classmethod
+    def parse(self, sec_bin):
+
+        # 非圧縮SECフォーマットの場合は簡単
+        if sec_bin[0] == 4:
+            x = int.from_bytes(sec_bin[1:33], "big")
+            y = int.from_bytes(sec_bin[33:65], "big")
+
+            return S256Point(x=x, y=y)
+        
+        # 圧縮SECフォーマットの場合
+        is_even = sec_bin[0] == 2
+        x = S256Field(int.from_bytes(sec_bin[1:], "big"))
+        
+        alpha = x ** 3 + S256Field(B) # secp256k1の左辺, つまりy^2
+        beta = alpha.sqrt() # y
+        
+        if beta.num % 2 == 0:
+            even_beta = beta
+            odd_beta = S256Field(P - beta.num)
+        else:
+            even_beta = S256Field(P - beta.num)
+            odd_beta = beta
+        
+        if is_even:
+            return S256Point(x, even_beta)
+        else:
+            return S256Point(x, odd_beta)
+    
+    def hash160(self, compressed=True):
+        return hash160(self.sec(compressed))
+    
+    def address(self, compressed=True, testnet=False):
+        h160 = self.hash160(compressed)
+        if testnet:
+            prefix = b"\x6f"
+        else:
+            prefix = b"\x00"
+        
+        return encode_base58_checksum(prefix + h160)
+        
 
 G = S256Point(GX, GY)
 
@@ -256,6 +344,31 @@ class Signature:
 
     def __repr__(self):
         return "Signature({:x}, {:x})".format(self.r, self.s)
+    
+    def der(self):
+        rbin = self.r.to_bytes(32, "big")
+        
+        # 先頭のnullバイトをすべて取り除く
+        rbin = rbin.lstrip(b"\x00")
+
+        # rbinの最上位ビットが1の場合、\x00を追加する
+        if rbin[0] & 0x80:
+            rbin = b"\x00" + rbin
+        
+        result = bytes([2, len(rbin)]) + rbin
+
+        sbin = self.s.to_bytes(32, "big")
+        # 先頭のnullバイトをすべて取り除く
+        sbin = sbin.lstrip(b"\x00")
+
+        # sbinの最上位ビットが1の場合、\x00を追加する
+        if sbin[0] & 0x80:
+            sbin = b"\x00" + sbin
+        
+        result += bytes([2, len(sbin)]) + sbin
+        
+        # 最後にDER署名のマーカーとそれ以降の長さの情報を足す
+        return bytes([0x30, len(result)]) + result
 
 
 class PrivateKey:
@@ -303,4 +416,21 @@ class PrivateKey:
             k = hmac.new(k, v + b'\x00', s256).digest()
             v = hmac.new(k, v, s256).digest()
 
-    
+    def wif(self, compressed=True, testnet=False):
+        secret_bytes = self.secret.to_bytes(32, "big")
+
+        # prefix
+        if testnet:
+            prefix = b"\xef"
+        else:
+            prefix = b"\x80"
+        
+        # suffix
+        if compressed:
+            suffix = b"\x01"
+        else:
+            suffix = b""
+
+        return encode_base58_checksum(prefix + secret_bytes + suffix)
+
+        
